@@ -1,0 +1,6 @@
+{
+  "approve": ["noindex"],
+  "link_fixes": {
+    "/gone.html": "/final.html"
+  }
+}

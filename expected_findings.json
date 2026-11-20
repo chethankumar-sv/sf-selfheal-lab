@@ -1,0 +1,12 @@
+[
+  {"path": "/no-h1.html",            "issue": "missing_h1"},
+  {"path": "/two-h1.html",           "issue": "multiple_h1"},
+  {"path": "/wrong-canonical.html",  "issue": "wrong_canonical"},
+  {"path": "/no-canonical.html",     "issue": "missing_canonical"},
+  {"path": "/hidden.html",           "issue": "noindex"},
+  {"path": "/old-a",                 "issue": "redirect_chain"},
+  {"path": "/dup-1.html",            "issue": "duplicate_title"},
+  {"path": "/dup-2.html",            "issue": "duplicate_title"},
+  {"path": "/gone.html",             "issue": "status_4xx"},
+  {"path": "/missing/page.html",     "issue": "status_4xx"}
+]
