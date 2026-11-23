@@ -1,4 +1,6 @@
 {
+  "/gone.html": "/final.html",
+  "/missing/page.html": "/final.html",
   "/old-a": "/final.html",
   "/old-b": "/old-c",
   "/old-c": "/final.html"
