@@ -1,5 +1,5 @@
 {
-  "/old-a": "/old-b",
+  "/old-a": "/final.html",
   "/old-b": "/old-c",
   "/old-c": "/final.html"
 }
