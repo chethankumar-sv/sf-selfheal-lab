@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import defaultdict
@@ -62,12 +63,166 @@ def show(title, rows):
         print("  " + row)
 
 
+AI_BASE_BRANCH = "demo-base"
+
+
+def ensure_base_branch(name, push=True):
+    """demo-base = a copy of main that PRs target, so main itself stays broken for demos."""
+    if not git("branch", "--list", name).strip():
+        git("branch", name, "main")
+        print(f"Created local branch {name} from main")
+    if not push:
+        return
+    remote = subprocess.run(["git", "ls-remote", "--exit-code", "--heads", "origin", name],
+                            cwd=ROOT, capture_output=True, text=True)
+    if remote.returncode != 0:
+        push = subprocess.run(["git", "push", "origin", name], cwd=ROOT, capture_output=True, text=True)
+        if push.returncode != 0:
+            sys.exit(f"Could not push {name} to origin (needed as the PR base):\n{push.stderr}")
+        print(f"Pushed {name} to origin")
+
+
+def preflight_ai(args):
+    """Fail fast, before any crawl or branch, if the AI/PR prerequisites are missing."""
+    from lab.ai_fix import NETWORK_HINT, configure_network
+
+    configure_network()
+    problems = []
+    try:
+        from cursor_sdk import Cursor, CursorAgentError
+    except ImportError:
+        sys.exit("cursor-sdk is not installed. Run: .venv/bin/pip install -r requirements.txt, "
+                 "then start with .venv/bin/python")
+    if not os.environ.get("CURSOR_API_KEY"):
+        problems.append("CURSOR_API_KEY is not set (export CURSOR_API_KEY=...)")
+    else:
+        # Read-only call: checks the key and that Cursor is reachable, before anything is created.
+        try:
+            Cursor.models.list()
+        except CursorAgentError as e:
+            problems.append(f"Cursor API check failed: {e}"
+                            + (f"\n    {NETWORK_HINT}" if "Network request failed" in str(e) else ""))
+    if not args.no_pr:
+        gh = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        if gh.returncode != 0:
+            problems.append("gh is not logged in (gh auth login), needed to open the PR")
+    if problems:
+        sys.exit("Cannot start the AI run:\n  - " + "\n  - ".join(problems))
+
+
+def split_summary(summary):
+    notes, review, skipped = [], [], []
+    for line in (summary or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("REVIEW:"):
+            review.append(line[7:].strip())
+        elif line.upper().startswith("SKIPPED:"):
+            skipped.append(line[8:].strip())
+        else:
+            notes.append(line)
+    return notes, review, skipped
+
+
+def open_pr(branch, base, body_file, title):
+    """Push the branch and open a PR into `base`. Returns a URL (PR or compare link) and a status line."""
+    push = subprocess.run(["git", "push", "-u", "origin", branch], cwd=ROOT, capture_output=True, text=True)
+    if push.returncode != 0:
+        return None, f"push failed: {(push.stderr or push.stdout).strip()}"
+    pr = subprocess.run(["gh", "pr", "create", "--base", base, "--head", branch, "--title", title,
+                         "--body-file", str(body_file)], cwd=ROOT, capture_output=True, text=True)
+    if pr.returncode == 0:
+        return pr.stdout.strip().splitlines()[-1], "PR created"
+    remote = git("remote", "get-url", "origin").strip().removesuffix(".git")
+    return f"{remote}/compare/{base}...{branch}?expand=1", f"gh could not create the PR ({(pr.stderr or '').strip()}); open the link"
+
+
+def run_ai(args, findings, exports, expected, found, detection_ok, config, run_dir, run_id, branch):
+    from lab.ai_fix import run_ai_fixes
+
+    _, read_csv, _, _ = load_audit()
+    ensure_base_branch(args.base_ref, push=not args.no_pr)
+    work = run_dir / "work"
+    git("worktree", "add", "-q", "-b", branch, str(work), args.base_ref)
+    approvals = set(config.get("approve", []))
+    inlinks = read_csv(exports["inlinks_4xx"]) if exports.get("inlinks_4xx") else []
+
+    print("\nAI FIX  (Cursor agent edits the worktree; crawl + assertions stay deterministic)")
+    ai_log = run_ai_fixes(findings, work, inlinks, config, approvals, git, "round 1")
+
+    after_findings, after_exports = crawl_and_detect(work / "site", run_dir / "after", "after fix")
+    for attempt in range(args.retries):
+        if not after_findings:
+            break
+        print(f"\n{len(after_findings)} issue(s) remain, retrying ({attempt + 1}/{args.retries})")
+        inl = read_csv(after_exports["inlinks_4xx"]) if after_exports.get("inlinks_4xx") else []
+        ai_log += run_ai_fixes(after_findings, work, inl, config, approvals, git, f"retry {attempt + 1}")
+        after_findings, after_exports = crawl_and_detect(work / "site", run_dir / "after", "after retry")
+
+    remaining = sorted(as_pairs(after_findings))
+    fix_ok = not remaining
+    show("RE-CRAWL  (was the issue fixed?)",
+         [f"{'STILL BROKEN' if pair in remaining else 'FIXED       '}  {pair[1]:<18} {pair[0]}"
+          for pair in sorted(expected, key=lambda p: (p[1], p[0]))])
+    new_issues = [pair for pair in remaining if pair not in expected]
+    if new_issues:
+        show("NEW issues introduced by the fixes", [f"{i:<18} {p}" for p, i in new_issues])
+    print(f"\nFix assertion: {'PASS' if fix_ok else 'FAIL'}")
+
+    # ---- PR body -------------------------------------------------------------------------------
+    review_all, pr = [], [f"# Self-heal (AI): fix {len(expected)} SEO issues found by the crawl", "",
+                          f"Branch: `{branch}` (base: `{args.base_ref}`). Fixes written by a Cursor agent, "
+                          "verified by a Screaming Frog re-crawl.", "", "## Changes", ""]
+    for issue, changed, summary, skip in ai_log:
+        notes, review, skipped = split_summary(summary)
+        review_all += [f"`{issue}`: {r}" for r in review]
+        pr.append(f"### {issue}")
+        pr += [f"- {n}" for n in notes]
+        if changed:
+            pr.append(f"- files: {', '.join(sorted(changed))}")
+        pr += [f"- NEEDS A HUMAN: {s}" for s in skipped] + ([f"- NEEDS A HUMAN: {skip}"] if skip else []) + [""]
+    if review_all:
+        pr += ["## Please review (AI judgement calls)", ""] + [f"- {r}" for r in review_all] + [""]
+    pr += ["## Verification", "",
+           f"- Baseline crawl: {len(found)} issues, matching expected_findings.json: {'yes' if detection_ok else 'NO'}",
+           f"- Re-crawl after fixes: {len(remaining)} issues remaining", ""]
+    pr_file = run_dir / "PR.md"
+    pr_file.write_text("\n".join(pr), encoding="utf-8")
+    (run_dir / "results.json").write_text(json.dumps({
+        "run_id": run_id, "branch": branch, "mode": "ai", "detection_ok": detection_ok, "fix_ok": fix_ok,
+        "expected": sorted(expected), "remaining": remaining}, indent=2), encoding="utf-8")
+
+    print(f"\nBranch:  {branch}  (git log {args.base_ref}..{branch})\nPR body: {pr_file}")
+    if args.no_pr:
+        print("--no-pr set: not pushing.")
+    elif not (detection_ok and fix_ok):
+        print("Not opening a PR because an assertion failed. Inspect the branch and retry.")
+    else:
+        url, status = open_pr(branch, args.base_ref, pr_file, f"Self-heal: fix {len(expected)} SEO issues (AI)")
+        print(f"\n{status}\nPR (needs human approval, base {args.base_ref}): {url}" if url else f"\n{status}")
+    ok = detection_ok and fix_ok
+    print("\nEND-TO-END: " + ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-ref", default="main", help="git ref holding the broken baseline (default: main)")
+    parser.add_argument("--base-ref", default=None,
+                        help="git ref the fix branch starts from (default: main, or demo-base with --ai)")
     parser.add_argument("--detect-only", action="store_true", help="stop after the detection assertion")
+    parser.add_argument("--ai", action="store_true",
+                        help="let a Cursor agent write the fixes, then push the branch and open a PR into the base branch")
+    parser.add_argument("--retries", type=int, default=1, help="extra AI rounds if issues remain (default: 1)")
+    parser.add_argument("--no-pr", action="store_true", help="with --ai: stop after the local branch (no push, no PR)")
     args = parser.parse_args()
+    if args.base_ref is None:
+        args.base_ref = AI_BASE_BRANCH if args.ai else "main"
+    if args.ai and args.base_ref == "main":
+        sys.exit("Refusing to open an AI PR into main (kept broken for demos). Use the default demo-base.")
 
+    if args.ai:
+        preflight_ai(args)
     if git("status", "--porcelain", "--", "site").strip():
         sys.exit("site/ has uncommitted changes. Commit or revert them so the baseline is known.")
     _, read_csv, _, _ = load_audit()
@@ -107,6 +262,8 @@ def main():
 
     # ---- 4. run the fixers in a git worktree on a new branch ----------------------------------
     branch = f"selfheal/{run_id}"
+    if args.ai:
+        return run_ai(args, findings, exports, expected, found, detection_ok, config, run_dir, run_id, branch)
     work = run_dir / "work"
     git("worktree", "add", "-q", "-b", branch, str(work), args.base_ref)
     patches = run_dir / "patches"
